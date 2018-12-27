@@ -325,6 +325,199 @@ class Darknet(nn.Module):
         return sum(output) if is_training else torch.cat(output, 1)
 
 
+#https://github.com/Eromera/erfnet_pytorch/blob/master/train/erfnet.py
+
+class DownsamplerBlock (nn.Module):
+    def __init__(self, ninput, noutput):
+        super().__init__()
+
+        self.conv = nn.Conv2d(ninput, noutput-ninput, (3, 3), stride=2, padding=1, bias=True)
+        self.pool = nn.MaxPool2d(2, stride=2)
+        self.bn = nn.BatchNorm2d(noutput, eps=1e-3)
+
+    def forward(self, input):
+        output = torch.cat([self.conv(input), self.pool(input)], 1)
+        output = self.bn(output)
+        return F.relu(output)
+
+class non_bottleneck_1d (nn.Module):
+    def __init__(self, chann, dropprob, dilated):
+        super().__init__()
+
+        self.conv3x1_1 = nn.Conv2d(chann, chann, (3, 1), stride=1, padding=(1,0), bias=True)
+
+        self.conv1x3_1 = nn.Conv2d(chann, chann, (1,3), stride=1, padding=(0,1), bias=True)
+
+        self.bn1 = nn.BatchNorm2d(chann, eps=1e-03)
+
+        self.conv3x1_2 = nn.Conv2d(chann, chann, (3, 1), stride=1, padding=(1*dilated,0), bias=True, dilation = (dilated,1))
+
+        self.conv1x3_2 = nn.Conv2d(chann, chann, (1,3), stride=1, padding=(0,1*dilated), bias=True, dilation = (1, dilated))
+
+        self.bn2 = nn.BatchNorm2d(chann, eps=1e-03)
+
+        self.dropout = nn.Dropout2d(dropprob)
+
+
+    def forward(self, input):
+
+        output = self.conv3x1_1(input)
+        output = F.relu(output)
+        output = self.conv1x3_1(output)
+        output = self.bn1(output)
+        output = F.relu(output)
+
+        output = self.conv3x1_2(output)
+        output = F.relu(output)
+        output = self.conv1x3_2(output)
+        output = self.bn2(output)
+
+        if (self.dropout.p != 0):
+            output = self.dropout(output)
+
+        return F.relu(output+input)    #+input = identity (residual connection)
+
+class UpsamplerBlock (nn.Module):
+    def __init__(self, ninput, noutput):
+        super().__init__()
+        self.conv = nn.ConvTranspose2d(ninput, noutput, 3, stride=2, padding=1, output_padding=1, bias=True)
+        self.bn = nn.BatchNorm2d(noutput, eps=1e-3)
+
+    def forward(self, input):
+        output = self.conv(input)
+        output = self.bn(output)
+        return F.relu(output)
+
+class ErfDetector(nn.Module):
+    def __init__(self, num_classes, anchors, img_size):
+        super().__init__()
+        self.loss_names = ['loss', 'x', 'y', 'w', 'h', 'conf', 'cls', 'nT', 'TP', 'FP', 'FPe', 'FN', 'TC']
+
+        self.layers = nn.ModuleList()
+
+        self.layers.append(DownsamplerBlock(3,16))
+
+        self.layers.append(DownsamplerBlock(16,64))
+
+        for x in range(0, 5):    #5 times
+           self.layers.append(non_bottleneck_1d(64, 0.03, 1))
+
+        self.layers.append(DownsamplerBlock(64,128))
+
+        for x in range(0, 2):    #2 times
+            self.layers.append(non_bottleneck_1d(128, 0.3, 2))
+            self.layers.append(non_bottleneck_1d(128, 0.3, 4))
+            self.layers.append(non_bottleneck_1d(128, 0.3, 8))
+            self.layers.append(non_bottleneck_1d(128, 0.3, 16))
+
+        output_conv = nn.Conv2d(128, 3 * (5 + num_classes), 1, stride=1, padding=0, bias=True)
+        self.layers.append(output_conv)
+
+        yolo0 = YOLOLayer(anchors=anchors[0:3], num_classes=num_classes, img_dim=img_size)
+        anchors=anchors[3:]
+        self.layers.append(yolo0)
+
+        self.yolos = nn.ModuleList()
+        self.yolos.append(yolo0)
+
+        upsample = UpsamplerBlock(128, 64)
+
+        self.layers.append(upsample)
+        self.layers.append(non_bottleneck_1d(64, 0, 1))
+        self.layers.append(non_bottleneck_1d(64, 0, 1))
+        self.skips = {len(self.layers) : 6}
+
+        self.layers.append(nn.Conv2d(64 + 64, 64, (1,1), stride=1, padding=0, bias=True))
+        self.layers.append(non_bottleneck_1d(64, 0, 1))
+        self.layers.append(non_bottleneck_1d(64, 0, 1))
+        self.layers.append(nn.Conv2d(64, 3*(5+num_classes), 1, stride=1, padding=0, bias=True))
+
+        yolo1 = YOLOLayer(anchors=anchors[0:3], num_classes=num_classes, img_dim=img_size)
+        anchors=anchors[3:]
+
+        self.layers.append(yolo1)
+        self.yolos.append(yolo1)
+
+        self.layers.append(UpsamplerBlock(64, 32))
+        self.layers.append(non_bottleneck_1d(32, 0, 1))
+        self.layers.append(non_bottleneck_1d(32, 0, 1))
+        self.skips[len(self.layers)] = 0
+
+        self.layers.append(non_bottleneck_1d(32 + 16, 0, 1))
+        self.layers.append(non_bottleneck_1d(32 + 16, 0, 1))
+
+        self.layers.append(nn.Conv2d(32+16, 3*(5+num_classes), 1, stride=1, padding=0, bias=True))
+        yolo2 = YOLOLayer(anchors=anchors[0:3], num_classes=num_classes, img_dim=img_size)
+        self.layers.append(yolo2)
+        self.yolos.append(yolo2)
+
+#        nn.ConvTranspose2d( 16, num_classes, 2, stride=2, padding=0, output_padding=0, bias=True)
+
+#        self.layers.append(UpsamplerBlock(64,16))
+#        self.layers.append(non_bottleneck_1d(16, 0, 1))
+#        self.layers.append(non_bottleneck_1d(16, 0, 1))
+
+#        nn.ConvTranspose2d( 16, num_classes, 2, stride=2, padding=0, output_padding=0, bias=True)
+
+
+    def forward(self, input, targets = None, batch_report=False, var=0):
+        is_training = targets is not None
+        self.losses = defaultdict(float)
+        outputs = []
+        per_layer_outputs = []
+        output = input
+        for idx, layer in enumerate(self.layers):
+            if(idx in self.skips):
+                output = torch.cat([output, per_layer_outputs[self.skips[idx]]], 1)
+#                print('Skip connection from {}'.format(self.skips[idx]))
+            if(layer in self.yolos):
+                if is_training:
+                    x, *losses = layer(output, targets, batch_report, var)
+                    for name, loss in zip(self.loss_names, losses):
+                        self.losses[name] += loss
+                else:
+                    x = layer(output)
+                outputs.append(x)
+                output = per_layer_outputs[-2]
+#                print('yolo')
+
+            else:
+                prev_shape = output.shape
+                output = layer(output)
+#                print(idx, prev_shape, output.shape)
+            per_layer_outputs.append(output)
+
+        if is_training:
+            if batch_report:
+                self.losses['TC'] /= 3  # target category
+                metrics = torch.zeros(3, len(self.losses['FPe']))  # TP, FP, FN
+
+                ui = np.unique(self.losses['TC'])[1:]
+                for i in ui:
+                    j = self.losses['TC'] == float(i)
+                    metrics[0, i] = (self.losses['TP'][j] > 0).sum().float()  # TP
+                    metrics[1, i] = (self.losses['FP'][j] > 0).sum().float()  # FP
+                    metrics[2, i] = (self.losses['FN'][j] == 3).sum().float()  # FN
+                metrics[1] += self.losses['FPe']
+
+                self.losses['TP'] = metrics[0].sum()
+                self.losses['FP'] = metrics[1].sum()
+                self.losses['FN'] = metrics[2].sum()
+                self.losses['metrics'] = metrics
+            else:
+                self.losses['TP'] = 0
+                self.losses['FP'] = 0
+                self.losses['FN'] = 0
+
+            self.losses['nT'] /= 3
+            self.losses['TC'] = 0
+
+
+        return sum(outputs) if is_training else torch.cat(outputs, 1)
+
+
+
+
 def load_weights(self, weights_path, cutoff=-1):
     # Parses and loads the weights stored in 'weights_path'
     # @:param cutoff  - save layers between 0 and cutoff (cutoff = -1 -> all are saved)
