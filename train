@@ -1,0 +1,5 @@
+unset PYTHONPATH
+CUDA_VISIBLE_DEVICES=0 python3 train.py \
+  --batch-size=16 \
+  --resume \
+  --report

@@ -76,6 +76,9 @@ def train(
         if checkpoint['optimizer'] is not None:
             optimizer.load_state_dict(checkpoint['optimizer'])
             best_loss = checkpoint['best_loss']
+        else:
+            best_loss = float('inf')
+
 
         del checkpoint  # current, saved
 
